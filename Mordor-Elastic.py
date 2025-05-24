@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# Import datasets to Elasticsearch or logstash instance
+# Import JSON-lines datasets to Elasticsearch or Logstash instance
 
 import sys
 import json
-import tarfile
 import requests
 from argparse import ArgumentParser
 from pathlib import Path
@@ -14,7 +13,7 @@ from termcolor import colored
 console = Console()
 
 # Argument parsing
-argparser = ArgumentParser(description="Import datasets into Elasticsearch or Logstash")
+argparser = ArgumentParser(description="Import JSON-lines datasets into Elasticsearch or Logstash")
 argparser.add_argument("--output", "-o", choices=["elasticsearch", "logstash"], default="elasticsearch", help="Choose Elasticsearch or Logstash as output")
 argparser.add_argument("--recursive", "-r", action="store_true", help="Recurse into directories")
 argparser.add_argument("--url", "-u", default="http://localhost:9200", help="URL of Elasticsearch or Logstash")
@@ -24,7 +23,7 @@ argparser.set_defaults(verify_certs=True)
 argparser.add_argument("--index", "-i", default="winlogbeat-mordor", help="Target index for data import")
 argparser.add_argument("--no-index-creation", "-n", dest="create_index", action="store_false", help="Don't create the index")
 argparser.set_defaults(create_index=True)
-argparser.add_argument("inputs", nargs="+", type=Path, help="Path to dataset")
+argparser.add_argument("inputs", nargs="+", type=Path, help="Path(s) to JSON-lines file(s)")
 
 args = argparser.parse_args()
 
@@ -34,14 +33,9 @@ if args.output == "elasticsearch":
     from elasticsearch.helpers import bulk
 
     console.print("[cyan]Initializing Elasticsearch...[/cyan]")
-    es = Elasticsearch(
-        [args.url],
-        ca_certs=args.cacerts,
-        verify_certs=args.verify_certs
-    )
-    if args.create_index:
-        if not es.indices.exists(index=args.index):
-            es.indices.create(index=args.index, body={"settings": {"index.mapping.total_fields.limit": 2000}})
+    es = Elasticsearch([args.url], ca_certs=args.cacerts, verify_certs=args.verify_certs)
+    if args.create_index and not es.indices.exists(index=args.index):
+        es.indices.create(index=args.index, body={"settings": {"index.mapping.total_fields.limit": 2000}})
 elif args.output == "logstash":
     console.print("[cyan]Initializing Logstash...[/cyan]")
     if args.verify_certs and args.cacerts:
@@ -57,25 +51,29 @@ else:
     console.print("[red]Output type not recognized. Exiting...[/red]")
     sys.exit(1)
 
-# Collect input paths
+# Collect input paths (only .json by default if recursive)
 if args.recursive:
-    paths = [p for path in args.inputs for p in path.rglob("*.tar.gz") if p.is_file()]
+    paths = [p for path in args.inputs for p in path.rglob("*.json") if p.is_file()]
 else:
-    paths = [path for path in args.inputs if path.is_file()]
+    paths = [p for p in args.inputs if p.is_file() and p.suffix.lower() == ".json"]
 
-console.print("[cyan]Calculating total file size...[/cyan]")
-total_size = sum([
-    member.size
-    for path in paths
-    for member in tarfile.open(path, mode="r:gz").getmembers() if member.isfile()
-])
+if not paths:
+    console.print("[red]No JSON files found. Exiting...[/red]")
+    sys.exit(1)
+
+# Calculate total size (bytes) for progress bar
+total_size = sum(p.stat().st_size for p in paths)
 
 def generate_actions(fileobj, logfile_path, progress_task, progress):
     for line in fileobj:
-        source = json.loads(line)
+        try:
+            source = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # skip invalid JSON lines
         source["log"] = {"file": {"name": logfile_path}}
         source.setdefault("winlog", {})
 
+        # --- (sama seperti sebelumnya) transformasi winlogbeat ---
         if "EventID" in source:
             source["winlog"]["event_id"] = source.pop("EventID", None)
             source.pop("type", None)
@@ -88,8 +86,8 @@ def generate_actions(fileobj, logfile_path, progress_task, progress):
             for k in list(source["winlog"]["event_data"].keys()):
                 source.pop(k, None)
 
-            source["winlog"]["computer_name"] = source.pop("Hostname", source.get("winlog", {}).get("computer_name", None))
-            source["winlog"]["channel"] = source.pop("Channel", source.get("winlog", {}).get("channel", None))
+            source["winlog"]["computer_name"] = source.pop("Hostname", source.get("winlog", {}).get("computer_name"))
+            source["winlog"]["channel"] = source.pop("Channel", source.get("winlog", {}).get("channel"))
 
         if "event_data" in source:
             source["winlog"]["event_data"] = source.pop("event_data")
@@ -109,7 +107,7 @@ def generate_actions(fileobj, logfile_path, progress_task, progress):
 
         if args.output == "elasticsearch":
             yield {"_index": args.index, "_source": source}
-        elif args.output == "logstash":
+        else:
             yield source
 
 # Main import loop
@@ -128,30 +126,25 @@ with Progress(
     transfer = progress.add_task("Importing logs...", total=total_size)
 
     for path in paths:
-        console.print(f"[green]Processing:[/green] {path}")
-        with tarfile.open(path, mode="r:gz") as tf:
-            for member in tf.getmembers():
-                if member.isfile():
-                    logfile = f"{path}/{member.name}"
-                    console.print(f"- [blue]Extracting {member.name}[/blue]")
-                    mf = tf.extractfile(member)
-
-                    if args.output == "elasticsearch":
-                        success_count, fail_count = bulk(es, generate_actions(mf, logfile, transfer, progress), stats_only=True)
-                        total_success += success_count
-                        total_failed += fail_count
-                        color = "green" if fail_count == 0 else "red"
-                    elif args.output == "logstash":
-                        success_count = fail_count = 0
-                        for event in generate_actions(mf, logfile, transfer, progress):
-                            r = requests.post(logstash_url, json=event, verify=verify_certs)
-                            if r.status_code == 200:
-                                success_count += 1
-                                total_success += 1
-                            else:
-                                fail_count += 1
-                                total_failed += 1
-                        color = "green" if fail_count == 0 else "red"
-                    console.print(colored(f"- Imported {success_count} events, {fail_count} failed", color))
+        console.print(f"[green]Processing[/green] {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            logfile = str(path)
+            if args.output == "elasticsearch":
+                success, failed = bulk(es, generate_actions(f, logfile, transfer, progress), stats_only=True)
+                total_success += success
+                total_failed += failed
+                color = "green" if failed == 0 else "red"
+            else:  # logstash
+                success = failed = 0
+                for event in generate_actions(f, logfile, transfer, progress):
+                    r = requests.post(logstash_url, json=event, verify=verify_certs)
+                    if r.status_code == 200:
+                        success += 1
+                        total_success += 1
+                    else:
+                        failed += 1
+                        total_failed += 1
+                color = "green" if failed == 0 else "red"
+            console.print(colored(f"- Imported {success} events, {failed} failed", color))
 
 console.print(f"[bold green]Done:[/bold green] Imported {total_success} records, [red]{total_failed} failed.[/red]")
